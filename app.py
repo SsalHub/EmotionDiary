@@ -3,27 +3,66 @@ from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import google.generativeai as genai
 from datetime import datetime
+import hashlib
+import json
 
-# --- 1. 기본 설정 및 상수 ---
+# --- 1. 기본 설정 및 디자인 ---
 st.set_page_config(
-    page_title="AI 감정 일기장",
-    page_icon="📝",
-    layout="wide"
+    page_title="마음의 쉼표 - AI 감정 일기장",
+    page_icon="☁️",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# 감정 점수와 이모티콘 매핑
+st.markdown("""
+    <style>
+    .stApp { background-color: #F0F8FF; }
+    .block-container { padding-top: 2rem; padding-bottom: 2rem; }
+    div[data-testid="stForm"], div.stDataFrame, div.stExpander, div[data-testid="stChatInput"] {
+        background-color: #FFFFFF;
+        padding: 20px;
+        border-radius: 20px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        border: 1px solid #E1E8F0;
+    }
+    div.stButton > button {
+        border-radius: 20px;
+        background-color: #87CEEB;
+        color: white;
+        border: none;
+        font-weight: bold;
+        transition: all 0.3s;
+    }
+    div.stButton > button:hover {
+        background-color: #00BFFF;
+        transform: scale(1.02);
+    }
+    section[data-testid="stSidebar"] { background-color: #FFFFFF; border-right: 1px solid #E6E6E6; }
+    .advice-box {
+        background-color: #E3F2FD;
+        border-left: 5px solid #2196F3;
+        padding: 20px;
+        border-radius: 15px;
+        color: #333333;
+        font-size: 1.1em;
+        line-height: 1.6;
+        margin-top: 20px;
+        margin-bottom: 20px;
+    }
+    h1, h2, h3 { color: #2C3E50; font-family: 'Helvetica Neue', sans-serif; }
+    </style>
+    """, unsafe_allow_html=True)
+
 MOOD_EMOJIS = {
-    1: "😫 매우 나쁨 (1점)",
-    2: "😟 나쁨 (2점)",
-    3: "😐 괜찮음 (3점)",
-    4: "🙂 좋음 (4점)",
-    5: "🥰 매우 좋음 (5점)"
+    1: "☁️ 흐림 (매우 나쁨)",
+    2: "🌦️ 비 (나쁨)",
+    3: "⛅ 구름 조금 (괜찮음)",
+    4: "☀️ 맑음 (좋음)",
+    5: "🌈 무지개 (매우 좋음)"
 }
 
-# --- 2. 로그인 유지 로직 (새로고침 대응) ---
-# URL에 사용자 정보가 남아있다면 자동으로 로그인 처리
+# --- 2. 로그인 및 설정 ---
 if 'is_logged_in' not in st.session_state:
-    # URL 쿼리 파라미터 확인
     if "user" in st.query_params and "name" in st.query_params:
         st.session_state['is_logged_in'] = True
         st.session_state['user_info'] = {
@@ -34,112 +73,134 @@ if 'is_logged_in' not in st.session_state:
         st.session_state['is_logged_in'] = False
         st.session_state['user_info'] = None
 
-# --- 3. 연결 및 AI 설정 ---
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 try:
     if "GOOGLE_API_KEY" in st.secrets:
         genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
     else:
-        st.error("secrets.toml에 GOOGLE_API_KEY가 없습니다.")
+        st.error("설정 오류: secrets.toml에 API 키가 없습니다.")
 except Exception as e:
-    st.error(f"API 설정 오류: {e}")
+    st.error(f"오류: {e}")
 
-# --- 4. 핵심 함수들 ---
+# --- 3. 함수 정의 ---
+
+def make_hashes(password):
+    return hashlib.sha256(str(password).encode()).hexdigest()
 
 def login_check(username, password):
-    """users 시트에서 사용자 확인"""
     try:
         users_df = conn.read(worksheet="users", ttl=0)
         users_df['password'] = users_df['password'].astype(str)
-        input_password = str(password)
-        
-        user_row = users_df[
-            (users_df['username'] == username) & 
-            (users_df['password'] == input_password)
-        ]
-        
-        if not user_row.empty:
-            return user_row.iloc[0]
+        input_hash = make_hashes(password)
+        user_row = users_df[(users_df['username'] == username) & (users_df['password'] == input_hash)]
+        if not user_row.empty: return user_row.iloc[0]
         return None
-    except Exception as e:
-        st.error(f"로그인 확인 중 오류 발생: {e}")
-        return None
+    except Exception: return None
 
 def get_ai_response(user_text):
-    """Gemini에게 조언과 점수를 요청"""
+    """일기 초기 분석용"""
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash') 
+        model = genai.GenerativeModel('gemini-2.5-flash')
         prompt = f"""
-        당신은 따뜻하고 통찰력 있는 심리 상담가입니다. 사용자의 일기를 읽고 분석해주세요.
+        당신은 따뜻한 심리 상담가입니다. 아래 일기를 읽고 답변해주세요.
         
         [요청사항]
-        1. 공감과 위로, 혹은 칭찬이 담긴 따뜻한 조언 (3문장 이내)
+        1. 공감과 위로, 혹은 칭찬이 담긴 따뜻한 조언 (부드러운 말투로 3문장 이내)
         2. 작성자의 기분을 1~5점 사이의 정수로 평가 (숫자만 출력)
-           (1:매우나쁨, 2:나쁨, 3:괜찮음, 4:좋음, 5:매우좋음)
         
         [출력형식]
-        조언 내용 텍스트
+        조언 내용
         |||
-        점수(숫자만)
-
+        점수
+        
         일기 내용: {user_text}
         """
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"AI 분석 실패: {e} ||| 3"
+        return f"AI 연결 실패: {e} ||| 3"
 
-# --- 5. 메인 화면 로직 ---
+def get_chat_response(diary_content, chat_history, new_question):
+    """이어지는 대화용"""
+    try:
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        history_text = ""
+        for chat in chat_history:
+            role = "상담사" if chat["role"] == "model" else "내담자"
+            history_text += f"{role}: {chat['text']}\n"
+            
+        prompt = f"""
+        당신은 내담자의 일기를 바탕으로 상담을 진행 중인 전문 심리 상담가입니다.
+        
+        [일기 내용]
+        {diary_content}
+        
+        [이전 대화 기록]
+        {history_text}
+        
+        [내담자의 새로운 질문]
+        {new_question}
+        
+        위 내용을 바탕으로 내담자의 마음에 공감하며 따뜻하게 답변해주세요.
+        """
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return "죄송해요, 잠시 연결이 불안정합니다."
 
-# [화면 A] 로그인 전
+# --- 4. 화면 로직 ---
+
 if not st.session_state['is_logged_in']:
-    st.title("🔐 AI 감정 일기장 로그인")
-    
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.info("로그인이 필요합니다.")
+    col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
+        st.markdown("<br><br><br>", unsafe_allow_html=True)
+        st.title("☁️ 마음의 쉼표")
+        st.markdown("##### 당신의 하루를 따뜻하게 기록해드립니다.")
         with st.form("login_form"):
             input_id = st.text_input("아이디")
             input_pw = st.text_input("비밀번호", type="password")
-            submit_login = st.form_submit_button("로그인")
-            
-            if submit_login:
+            submitted = st.form_submit_button("로그인", use_container_width=True)
+            if submitted:
                 user = login_check(input_id, input_pw)
                 if user is not None:
-                    # 세션 상태 업데이트
                     st.session_state['is_logged_in'] = True
                     st.session_state['user_info'] = user
-                    
-                    # ⭐ 로그인 유지: URL에 사용자 정보 저장 (새로고침 방지용)
                     st.query_params["user"] = user['username']
                     st.query_params["name"] = user['name']
-                    
-                    st.toast(f"{user['name']}님 환영합니다!", icon="👋")
                     st.rerun()
                 else:
-                    st.error("아이디 또는 비밀번호가 일치하지 않습니다.")
+                    st.error("아이디 또는 비밀번호를 확인해주세요.")
 
-# [화면 B] 로그인 후 (메인 앱)
 else:
     current_user = st.session_state['user_info']['username']
     current_name = st.session_state['user_info']['name']
 
-    # 사이드바
     with st.sidebar:
-        st.header(f"반가워요, {current_name}님! 🍀")
-        if st.button("로그아웃"):
-            # 로그아웃 시 세션 및 URL 정보 모두 삭제
+        st.title(f"{current_name}님의\n마음 기록 ☁️")
+        st.write("")
+        menu = st.radio("메뉴 이동", ["📊 대시보드", "🖊️ 일기 쓰기"], index=0)
+        st.write("")
+        st.markdown("---")
+        if st.button("로그아웃", use_container_width=True):
             st.session_state['is_logged_in'] = False
             st.query_params.clear()
             st.rerun()
 
-    st.title(f"📖 {current_name}의 감정 일기장")
-
-    # === 데이터 로딩 (공통 사용) ===
+    # --- 데이터 로드 및 안전한 전처리 (핵심 수정) ---
     try:
         all_diaries = conn.read(worksheet="diaries", ttl=0)
+        
+        # 1. chat_history 컬럼이 없으면 생성
+        if not all_diaries.empty and 'chat_history' not in all_diaries.columns:
+            all_diaries['chat_history'] = "[]"
+        
+        # 2. NaN 값을 빈 리스트 문자열 "[]"로 일괄 채우기 (에러 방지 핵심!)
+        if not all_diaries.empty:
+            all_diaries['chat_history'] = all_diaries['chat_history'].fillna("[]")
+            all_diaries['chat_history'] = all_diaries['chat_history'].astype(str)
+
         if all_diaries.empty:
             my_data = pd.DataFrame()
         elif 'username' in all_diaries.columns:
@@ -148,181 +209,160 @@ else:
             my_data['emotion_tag'] = pd.to_numeric(my_data['emotion_tag'], errors='coerce')
         else:
             my_data = pd.DataFrame()
-    except Exception:
+    except Exception as e:
+        st.error(f"데이터 로드 중 오류: {e}")
         all_diaries = pd.DataFrame()
         my_data = pd.DataFrame()
 
-    # === 탭 구성 ===
-    tab_dashboard, tab_write = st.tabs(["📊 대시보드 (기록 & 그래프)", "🖊️ 일기 쓰기"])
-
-    # ---------------------------------------------------------
-    # 탭 1: 대시보드 (월별 그래프 + 목록)
-    # ---------------------------------------------------------
-    with tab_dashboard:
-        st.subheader("📈 내 기분 흐름과 지난 이야기")
-        
+    # === [메뉴 1] 대시보드 ===
+    if menu == "📊 대시보드":
+        st.header("📈 내 마음의 날씨 흐름")
         if not my_data.empty:
-            # ⭐ 월별 필터 기능 추가
-            # 1. 'YYYY-MM' 형식의 컬럼 생성
             my_data['month_str'] = my_data['date'].dt.strftime('%Y-%m')
-            
-            # 2. 존재하는 월 목록 추출 (최신순)
             available_months = sorted(my_data['month_str'].unique(), reverse=True)
+            col_sel, _ = st.columns([1, 3])
+            with col_sel:
+                selected_month = st.selectbox("📅 월 선택", available_months)
             
-            # 3. 선택 박스 (그래프 바로 위)
-            col_filter, col_empty = st.columns([1, 3])
-            with col_filter:
-                selected_month = st.selectbox("조회할 월을 선택하세요", available_months)
-            
-            # 4. 데이터 필터링
             filtered_data = my_data[my_data['month_str'] == selected_month].sort_values('date')
             
             if not filtered_data.empty:
-                # 5. 그래프 그리기 (필터링된 데이터 사용)
+                st.markdown("##### 감정 변화 그래프")
                 chart_data = filtered_data.set_index('date')['emotion_tag']
-                st.line_chart(chart_data)
+                st.line_chart(chart_data, color="#87CEEB")
                 
-                avg_mood = filtered_data['emotion_tag'].mean()
-                st.caption(f"💡 {selected_month}의 평균 기분 점수는 **{avg_mood:.1f}점**입니다.")
-            else:
-                st.info("선택한 월에 데이터가 없습니다.")
-            
-            st.divider()
-            
-            # 6. 하단: 지난 기록 리스트 (필터링된 월 데이터만 보여줌)
-            st.subheader(f"📋 {selected_month} 일기 목록")
-            # 최신순 정렬
-            display_df = filtered_data.sort_values(by="date", ascending=False)
-            
-            for index, row in display_df.iterrows():
-                try: score_val = int(row['emotion_tag'])
-                except: score_val = 3
-                
-                with st.expander(f"{row['date'].strftime('%Y-%m-%d')} - {MOOD_EMOJIS.get(score_val, '알수없음')}"):
-                    st.write(f"**📝 내용:** {row['content']}")
-                    # 조언은 info 박스로 깔끔하게
-                    st.info(f"**💌 AI 조언:** {row['ai_advice']}")
-        else:
-            st.info("아직 데이터가 없습니다. '일기 쓰기' 탭에서 첫 기록을 남겨보세요!")
+                st.markdown("---")
+                st.subheader(f"📋 {selected_month}의 기록들")
+                display_df = filtered_data.sort_values(by="date", ascending=False)
+                for _, row in display_df.iterrows():
+                    try: score = int(row['emotion_tag'])
+                    except: score = 3
+                    with st.expander(f"{row['date'].strftime('%Y-%m-%d')} : {MOOD_EMOJIS.get(score, '')}"):
+                        st.write(row['content'])
+                        st.markdown(f"<div style='background-color:#F5F5F5; padding:10px; border-radius:10px; margin-top:10px;'>💌 <b>AI:</b> {row['ai_advice']}</div>", unsafe_allow_html=True)
+            else: st.info("선택하신 달의 데이터가 없습니다.")
+        else: st.info("아직 기록된 일기가 없습니다.")
 
-    # ---------------------------------------------------------
-    # 탭 2: 일기 쓰기
-    # ---------------------------------------------------------
-    with tab_write:
-        st.subheader("오늘의 마음 기록")
-        
-        selected_date = st.date_input("날짜 선택", datetime.now())
+    # === [메뉴 2] 일기 쓰기 (대화 기능 포함) ===
+    elif menu == "🖊️ 일기 쓰기":
+        st.header("오늘의 마음 기록하기 🖊️")
+        selected_date = st.date_input("날짜를 선택해 주세요", datetime.now())
         selected_date_str = selected_date.strftime("%Y-%m-%d")
         
         current_day_entry = pd.DataFrame()
         if not my_data.empty:
-            my_data['date_str_check'] = my_data['date'].dt.strftime("%Y-%m-%d")
-            current_day_entry = my_data[my_data['date_str_check'] == selected_date_str]
+            my_data['date_str_chk'] = my_data['date'].dt.strftime("%Y-%m-%d")
+            current_day_entry = my_data[my_data['date_str_chk'] == selected_date_str]
 
-        # === [상황 A: 수정 모드] ===
+        # --- [상황 A: 일기가 이미 있을 때 (수정 + 채팅 모드)] ---
         if not current_day_entry.empty:
-            st.success(f"✅ {selected_date_str}의 일기가 저장되었습니다! 오늘의 조언을 확인해보세요.")
+            row = current_day_entry.iloc[0]
             
-            existing_row = current_day_entry.iloc[0]
-            existing_id = existing_row['id']
-            existing_content = existing_row['content']
-            existing_advice = existing_row['ai_advice']
-            existing_score = int(existing_row['emotion_tag'])
-
-            with st.form("edit_form"):
-                content = st.text_area("내용 수정하기", value=existing_content, height=150)
-                submit_update = st.form_submit_button("수정 및 AI 재분석 🔄")
-
-                if submit_update and content:
-                    with st.spinner("수정된 내용을 다시 분석 중입니다..."):
-                        full_response = get_ai_response(content)
-                        if "|||" in full_response:
-                            ai_advice, score_text = full_response.split("|||")
-                            try:
-                                score = int(score_text.strip())
-                                score = max(1, min(5, score))
-                            except: score = 3
-                        else:
-                            ai_advice = full_response; score = 3
-                        
-                        all_diaries = conn.read(worksheet="diaries", ttl=0)
-                        all_diaries['id'] = pd.to_numeric(all_diaries['id'], errors='coerce')
-                        
-                        row_idx = all_diaries.index[all_diaries['id'] == pd.to_numeric(existing_id, errors='coerce')].tolist()
-                        
-                        if row_idx:
-                            idx = row_idx[0]
+            # 1. 일기 수정 섹션
+            with st.expander("📝 일기 내용 수정하기"):
+                with st.form("edit_form"):
+                    content = st.text_area("내용", value=row['content'], height=150)
+                    if st.form_submit_button("수정 및 재분석 🔄"):
+                        with st.spinner("분석 중..."):
+                            full_res = get_ai_response(content)
+                            if "|||" in full_res: advice, sc = full_res.split("|||"); score=int(sc.strip())
+                            else: advice=full_res; score=3
+                            
+                            all_diaries['id'] = pd.to_numeric(all_diaries['id'], errors='coerce')
+                            idx = all_diaries.index[all_diaries['id'] == pd.to_numeric(row['id'], errors='coerce')].tolist()[0]
                             all_diaries.at[idx, 'content'] = content
-                            all_diaries.at[idx, 'ai_advice'] = ai_advice.strip()
-                            all_diaries.at[idx, 'emotion_tag'] = score
-                            all_diaries.at[idx, 'timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            all_diaries.at[idx, 'ai_advice'] = advice.strip()
+                            all_diaries.at[idx, 'emotion_tag'] = max(1, min(5, score))
+                            all_diaries.at[idx, 'chat_history'] = "[]" # 수정 시 채팅 초기화
                             
                             conn.update(worksheet="diaries", data=all_diaries)
                             st.cache_data.clear()
                             st.rerun()
-                        else:
-                            st.error("데이터 오류: 수정할 대상을 찾지 못했습니다.")
 
-            # ⭐ 디자인 변경 요청 반영: 검정 배경 + 흰색 글씨
-            st.divider()
-            st.subheader("💌 오늘의 AI 조언")
-            
-            st.markdown(f"""
-            <div style="
-                background-color: #000000; 
-                color: #ffffff; 
-                padding: 20px; 
-                border-radius: 10px; 
-                line-height: 1.6;
-                font-size: 1.1em;
-                box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-                {existing_advice}
-            </div>
-            """, unsafe_allow_html=True)
-            
-            st.write("")
-            st.info(f"오늘의 기분 점수: **{existing_score}점** {MOOD_EMOJIS.get(existing_score, '')}")
+            st.markdown(f"""<div class="advice-box">{row['ai_advice']}</div>""", unsafe_allow_html=True)
+            score_val = int(row['emotion_tag'])
+            st.info(f"오늘의 마음 날씨: **{MOOD_EMOJIS.get(score_val, '')}**")
 
-        # === [상황 B: 신규 작성 모드] ===
+            # --- 💬 2. AI 상담 채팅 기능 ---
+            st.markdown("---")
+            st.subheader("💬 AI 선생님과 대화하기")
+            
+            # (0) 채팅 기록 안전하게 불러오기 (에러 수정됨)
+            chat_history = []
+            raw_history = str(row['chat_history'])
+            
+            # "nan", "None", "" 등 비정상적인 값 처리
+            if raw_history in ['nan', 'None', '', 'NaN']:
+                chat_history = []
+            else:
+                try:
+                    chat_history = json.loads(raw_history)
+                    if not isinstance(chat_history, list): # 리스트가 아니면 초기화
+                        chat_history = []
+                except:
+                    chat_history = []
+            
+            # (1) 대화 초기화 버튼 (요청하신 기능)
+            col_clear, col_dummy = st.columns([1, 4])
+            with col_clear:
+                if st.button("🗑️ 대화 내용 지우기"):
+                    all_diaries['id'] = pd.to_numeric(all_diaries['id'], errors='coerce')
+                    target_idx = all_diaries.index[all_diaries['id'] == pd.to_numeric(row['id'], errors='coerce')].tolist()[0]
+                    all_diaries.at[target_idx, 'chat_history'] = "[]"
+                    conn.update(worksheet="diaries", data=all_diaries)
+                    st.cache_data.clear()
+                    st.rerun()
+
+            # (2) 이전 대화 화면 표시
+            for chat in chat_history:
+                with st.chat_message(chat["role"]):
+                    st.write(chat["text"])
+
+            # (3) 사용자 입력 처리
+            if user_input := st.chat_input("하고 싶은 말을 적어보세요..."):
+                with st.chat_message("user"):
+                    st.write(user_input)
+                
+                chat_history.append({"role": "user", "text": user_input})
+
+                with st.spinner("답변 작성 중..."):
+                    ai_reply = get_chat_response(row['content'], chat_history, user_input)
+                
+                with st.chat_message("model"):
+                    st.write(ai_reply)
+                
+                chat_history.append({"role": "model", "text": ai_reply})
+
+                # DB 업데이트
+                updated_history_json = json.dumps(chat_history, ensure_ascii=False)
+                all_diaries['id'] = pd.to_numeric(all_diaries['id'], errors='coerce')
+                target_idx = all_diaries.index[all_diaries['id'] == pd.to_numeric(row['id'], errors='coerce')].tolist()[0]
+                all_diaries.at[target_idx, 'chat_history'] = updated_history_json
+                
+                conn.update(worksheet="diaries", data=all_diaries)
+                st.cache_data.clear()
+
+        # --- [상황 B: 신규 작성 모드] ---
         else:
-            with st.form("diary_form"):
-                content = st.text_area("내용", height=200, placeholder=f"{selected_date_str}의 일기를 작성해보세요.")
-                submit_diary = st.form_submit_button("AI 조언 받기 및 저장 ✨")
-
-                if submit_diary and content:
-                    with st.spinner("AI 분석 및 저장 중..."):
-                        full_response = get_ai_response(content)
-                        if "|||" in full_response:
-                            ai_advice, score_text = full_response.split("|||")
-                            try:
-                                score = int(score_text.strip())
-                                score = max(1, min(5, score))
-                            except: score = 3
-                        else:
-                            ai_advice = full_response; score = 3
-
-                        all_diaries = conn.read(worksheet="diaries", ttl=0)
-                        if all_diaries.empty or 'id' not in all_diaries.columns:
-                            new_id = 1
-                        else:
-                            max_id = pd.to_numeric(all_diaries['id'], errors='coerce').max()
-                            new_id = 1 if pd.isna(max_id) else int(max_id) + 1
-
-                        new_data = pd.DataFrame([{
-                            "id": new_id,
-                            "username": current_user,
-                            "date": selected_date_str,
-                            "content": content,
-                            "ai_advice": ai_advice.strip(),
-                            "emotion_tag": score,
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        }])
-                        
-                        if all_diaries.empty:
-                            updated_df = new_data
-                        else:
-                            updated_df = pd.concat([all_diaries, new_data], ignore_index=True)
-                        
-                        conn.update(worksheet="diaries", data=updated_df)
-                        st.cache_data.clear()
-                        st.rerun()
+            with st.form("new_diary_form"):
+                content = st.text_area("오늘 하루는 어떠셨나요?", height=250, placeholder="이야기를 털어놓으세요.")
+                if st.form_submit_button("기록 저장하고 조언 듣기 ✨", use_container_width=True):
+                    if content:
+                        with st.spinner("분석 중..."):
+                            full_res = get_ai_response(content)
+                            if "|||" in full_res: advice, sc = full_res.split("|||"); score=int(sc.strip())
+                            else: advice=full_res; score=3
+                            
+                            if all_diaries.empty or 'id' not in all_diaries.columns: new_id = 1
+                            else: new_id = int(pd.to_numeric(all_diaries['id'], errors='coerce').max()) + 1
+                            
+                            new_data = pd.DataFrame([{
+                                "id": new_id, "username": current_user, "date": selected_date_str,
+                                "content": content, "ai_advice": advice.strip(), "emotion_tag": max(1, min(5, score)),
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "chat_history": "[]"
+                            }])
+                            updated = pd.concat([all_diaries, new_data], ignore_index=True) if not all_diaries.empty else new_data
+                            conn.update(worksheet="diaries", data=updated)
+                            st.cache_data.clear()
+                            st.rerun()
