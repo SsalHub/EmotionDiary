@@ -322,7 +322,9 @@ if not st.session_state['is_logged_in']:
                             st.error("아이디 또는 비밀번호를 확인해주세요.")
             
             st.write("")
-            col_msg, col_switch = st.columns([2, 1])
+            # col_msg, col_switch = st.columns([2, 1])
+            # [수정 후] 버튼 쪽(col_switch) 비율을 2로 늘림
+            col_msg, col_switch = st.columns([1.5, 2])
             with col_msg: st.write("아직 계정이 없으신가요?")
             with col_switch:
                 if st.button("📝 회원가입 하러가기", type="secondary", use_container_width=True):
