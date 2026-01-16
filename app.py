@@ -2,7 +2,7 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import google.generativeai as genai
-from datetime import datetime
+from datetime import datetime, timedelta # ⭐ timedelta 추가
 import hashlib
 import json
 import re
@@ -104,9 +104,6 @@ MOOD_EMOJIS = {
 # --- 2. 세션 초기화 ---
 if 'is_logged_in' not in st.session_state:
     if "user" in st.query_params and "name" in st.query_params:
-        # URL 복원 시 보안상 재로그인이 원칙이나, 편의상 유지한다면 ID 등도 같이 파라미터에 있어야 함
-        # 여기서는 user_id가 없으므로 일단 로그아웃 처리하거나, 필요한 로직 추가 필요
-        # (간소화를 위해 재로그인 유도)
         st.session_state['is_logged_in'] = False
         st.session_state['user_info'] = None
     else:
@@ -155,7 +152,6 @@ def login_check(username, password):
         user_row = users_df[(users_df['username'] == username) & (users_df['password'] == input_hash)]
         
         if not user_row.empty:
-            # ⭐ role 컬럼이 없을 경우를 대비해 기본값 처리
             user_data = user_row.iloc[0].to_dict()
             if 'role' not in user_data or pd.isna(user_data['role']):
                 user_data['role'] = 'user'
@@ -182,7 +178,7 @@ def register_user(username, password, name):
             "username": username,
             "password": pw_hash,
             "name": name,
-            "role": "user" # 기본값은 일반 유저
+            "role": "user"
         }])
         
         updated_df = pd.concat([users_df, new_user], ignore_index=True)
@@ -191,10 +187,9 @@ def register_user(username, password, name):
     except Exception as e:
         return False, f"오류: {e}"
 
-def update_user_info(target_uuid, new_name=None, new_password=None): # ⭐ 식별자 username -> user_id(uuid)로 변경
+def update_user_info(target_uuid, new_name=None, new_password=None):
     try:
         users_df = conn.read(worksheet="users", ttl=0)
-        # UUID로 유저 찾기
         idx_list = users_df.index[users_df['user_id'] == target_uuid].tolist()
         
         if not idx_list:
@@ -212,28 +207,77 @@ def update_user_info(target_uuid, new_name=None, new_password=None): # ⭐ 식�
     except Exception as e:
         return False, f"수정 중 오류 발생: {e}"
 
-def get_ai_response(user_text, user_name):
+# ⭐ [신규] 최근 30일 일기 가져오는 함수
+def get_past_diaries_text(user_id, days=30):
+    """
+    해당 유저의 최근 n일간 일기 내용을 문자열로 요약하여 반환
+    """
+    try:
+        # 데이터 로드 (캐시 활용)
+        df = conn.read(worksheet="diaries", ttl="10m")
+        if df.empty: return "과거 기록 없음"
+        
+        # 날짜 형식 변환 및 필터링
+        # user_id 컬럼이 있는지 확인 (구형 데이터 호환성)
+        if 'user_id' not in df.columns:
+            return "과거 기록을 불러올 수 없습니다 (DB 스키마 구형)."
+
+        df['date'] = pd.to_datetime(df['date'])
+        cutoff_date = datetime.now() - timedelta(days=days)
+        
+        # 내 아이디 + 최근 30일 + 날짜순 정렬
+        my_history = df[
+            (df['user_id'] == user_id) & 
+            (df['date'] >= cutoff_date)
+        ].sort_values('date')
+        
+        if my_history.empty:
+            return "최근 작성된 과거 기록이 없습니다."
+        
+        # 문자열로 변환 (예: [2026-01-01] (3점) : 오늘은 힘들었다...)
+        history_text = ""
+        for _, row in my_history.iterrows():
+            date_str = row['date'].strftime("%Y-%m-%d")
+            score = row['emotion_tag']
+            content = str(row['content'])[:200] # 너무 길면 200자 정도로 요약
+            history_text += f"[{date_str}] (기분 {score}점): {content}\n"
+            
+        return history_text
+        
+    except Exception as e:
+        return f"기록 불러오기 실패: {e}"
+
+# ⭐ [수정] 프롬프트에 과거 기록(past_history) 반영
+def get_ai_response(user_text, user_name, past_history=""):
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
         prompt = f"""
-        당신은 따뜻한 심리 상담가입니다. 
-        <instructions>
-        내담자의 이름은 '{user_name}'입니다. 답변 시 '작성자'나 '내담자' 대신 반드시 '{user_name}님'이라고 부르세요.
-        아래 <diary> 태그 안의 일기를 분석하세요.
+        당신은 내담자({user_name}님)의 삶의 맥락을 깊이 이해하는 전담 심리 상담가입니다.
+        단편적인 조언이 아니라, 과거의 흐름을 고려하여 통찰력 있는 답변을 해주세요.
         
-        [요청사항]
-        1. 공감과 위로, 혹은 칭찬이 담긴 따뜻한 조언 (부드러운 말투로 3문장 이내)
-        2. 작성자의 기분을 1~5점 사이의 정수로 평가 (숫자만 출력)
+        <context>
+        아래는 {user_name}님이 최근 한 달 동안 작성한 일기 기록입니다.
+        이 기록을 통해 내담자의 최근 감정 변화 추이, 반복되는 고민, 혹은 긍정적인 변화를 파악하세요.
+        
+        {past_history}
+        </context>
+
+        <diary>
+        오늘의 일기:
+        {user_text}
+        </diary>
+        
+        <instructions>
+        1. **맥락 연결:** 과거 기록과 오늘의 일기를 연결 지어 언급하세요. (예: "지난주에는 ~때문에 힘들어하셨는데, 오늘은 좀 나아지신 것 같아 다행이에요" 또는 "저번부터 계속 ~로 고민이 깊으시군요.")
+        2. **호칭:** 반드시 '{user_name}님'이라고 부르세요.
+        3. **분량:** 따뜻하고 구체적인 조언으로 3~4문장.
+        4. **평가:** 작성자의 오늘 기분을 1~5점 사이의 정수로 평가 (숫자만 출력).
         
         [출력형식]
         조언 내용
         |||
         점수
         </instructions>
-
-        <diary>
-        {user_text}
-        </diary>
         """
         response = model.generate_content(prompt)
         return response.text
@@ -322,8 +366,6 @@ if not st.session_state['is_logged_in']:
                             st.error("아이디 또는 비밀번호를 확인해주세요.")
             
             st.write("")
-            # col_msg, col_switch = st.columns([2, 1])
-            # [수정 후] 버튼 쪽(col_switch) 비율을 2로 늘림
             col_msg, col_switch = st.columns([1.5, 2])
             with col_msg: st.write("아직 계정이 없으신가요?")
             with col_switch:
@@ -375,7 +417,7 @@ if not st.session_state['is_logged_in']:
                             st.warning("모든 정보를 입력해주세요.")
 
             st.write("")
-            col_msg, col_switch = st.columns([2, 1])
+            col_msg, col_switch = st.columns([1.5, 2])
             with col_msg: st.write("이미 계정이 있으신가요?")
             with col_switch:
                 if st.button("🔒 로그인 하러가기", type="secondary", use_container_width=True):
@@ -384,24 +426,22 @@ if not st.session_state['is_logged_in']:
 
 else:
     # 로그인 정보 가져오기
-    current_user_id = st.session_state['user_info']['user_id'] # ⭐ UUID 기준
+    current_user_id = st.session_state['user_info']['user_id']
     current_username = st.session_state['user_info']['username']
     current_name = st.session_state['user_info']['name']
-    current_role = st.session_state['user_info'].get('role', 'user') # ⭐ 권한 확인
+    current_role = st.session_state['user_info'].get('role', 'user')
 
     with st.sidebar:
         st.title(f"{current_name}님의\n마음 기록 ☁️")
         
-        # 관리자 뱃지 표시
         if current_role == 'admin':
             st.markdown("### 👑 Administrator")
             
         st.write("")
         
-        # ⭐ 메뉴 구성 (관리자일 경우 메뉴 추가)
         menu_options = ["📊 대시보드", "🖊️ 일기 쓰기", "⚙️ 내 정보 수정"]
         if current_role == 'admin':
-            menu_options.insert(0, "👑 관리자 페이지") # 맨 위에 추가
+            menu_options.insert(0, "👑 관리자 페이지")
             
         menu = st.radio("메뉴 이동", menu_options, index=1 if current_role == 'admin' else 0)
         
@@ -412,28 +452,22 @@ else:
             st.query_params.clear()
             st.rerun()
 
-    # === [메뉴 0] 관리자 페이지 (신규 기능) ===
+    # === [메뉴 0] 관리자 페이지 ===
     if menu == "👑 관리자 페이지" and current_role == 'admin':
         st.header("👑 관리자 대시보드")
         
-        # 전체 데이터 로드 (필터링 없이)
         try:
             all_users = conn.read(worksheet="users", ttl="10m")
             all_diaries = conn.read(worksheet="diaries", ttl="10m")
             
-            # 통계 카드
             c1, c2, c3 = st.columns(3)
-            with c1:
-                st.metric("총 가입자 수", f"{len(all_users)}명")
-            with c2:
-                st.metric("총 일기 수", f"{len(all_diaries)}개")
+            with c1: st.metric("총 가입자 수", f"{len(all_users)}명")
+            with c2: st.metric("총 일기 수", f"{len(all_diaries)}개")
             with c3:
                 avg_mood = all_diaries['emotion_tag'].mean() if not all_diaries.empty else 0
                 st.metric("전체 평균 기분", f"{avg_mood:.1f}점")
             
             st.divider()
-            
-            # 탭으로 관리 기능 분리
             admin_tab1, admin_tab2 = st.tabs(["👥 유저 관리", "📝 전체 일기 모니터링"])
             
             with admin_tab1:
@@ -443,18 +477,14 @@ else:
             with admin_tab2:
                 st.subheader("최신 작성 일기")
                 if not all_diaries.empty:
-                    # 유저 닉네임과 join (merge)
                     merged_df = pd.merge(all_diaries, all_users[['user_id', 'name']], on='user_id', how='left')
                     merged_df['date'] = pd.to_datetime(merged_df['date'])
-                    
                     st.dataframe(
                         merged_df[['date', 'name', 'content', 'emotion_tag', 'ai_advice']].sort_values('date', ascending=False),
-                        use_container_width=True,
-                        height=400
+                        use_container_width=True, height=400
                     )
                 else:
                     st.info("작성된 일기가 없습니다.")
-                    
         except Exception as e:
             st.error(f"관리자 데이터 로드 실패: {e}")
 
@@ -469,7 +499,6 @@ else:
 
             if all_diaries.empty: my_data = pd.DataFrame()
             elif 'user_id' in all_diaries.columns:
-                # ⭐ username 대신 user_id(UUID)로 필터링
                 my_data = all_diaries[all_diaries['user_id'] == current_user_id].copy()
                 my_data['date'] = pd.to_datetime(my_data['date'])
                 my_data['emotion_tag'] = pd.to_numeric(my_data['emotion_tag'], errors='coerce')
@@ -514,7 +543,6 @@ else:
                 
             if all_diaries.empty: my_data = pd.DataFrame()
             elif 'user_id' in all_diaries.columns:
-                # ⭐ UUID 필터링
                 my_data = all_diaries[all_diaries['user_id'] == current_user_id].copy()
                 my_data['date'] = pd.to_datetime(my_data['date'])
                 my_data['emotion_tag'] = pd.to_numeric(my_data['emotion_tag'], errors='coerce')
@@ -542,7 +570,8 @@ else:
                         if check_rate_limit("edit_diary", 5):
                             with st.spinner("분석 중..."):
                                 safe_content = sanitize_for_sheets(content)
-                                full_res = get_ai_response(safe_content, current_name)
+                                # 수정 모드에서는 기존 데이터만으로 분석 (과거 기록 연결은 선택사항이나 여기선 단순 유지)
+                                full_res = get_ai_response(safe_content, current_name) 
                                 if "|||" in full_res: advice, sc = full_res.split("|||"); score=int(sc.strip())
                                 else: advice=full_res; score=3
                                 
@@ -614,9 +643,16 @@ else:
                 if st.form_submit_button("기록 저장하고 조언 듣기 ✨", type="primary", use_container_width=True):
                     if check_rate_limit("new_diary", 5):
                         if content:
-                            with st.spinner("분석 중..."):
+                            # ⭐ [수정] 멘트 변경
+                            with st.spinner("과거의 기억을 되짚으며 분석 중..."):
                                 safe_content = sanitize_for_sheets(content)
-                                full_res = get_ai_response(safe_content, current_name)
+                                
+                                # ⭐ [수정] 1. 과거 기록 가져오기
+                                past_history = get_past_diaries_text(current_user_id)
+                                
+                                # ⭐ [수정] 2. AI에게 과거 기록과 함께 전달
+                                full_res = get_ai_response(safe_content, current_name, past_history)
+                                
                                 if "|||" in full_res: advice, sc = full_res.split("|||"); score=int(sc.strip())
                                 else: advice=full_res; score=3
                                 
@@ -626,8 +662,8 @@ else:
                                 
                                 new_data = pd.DataFrame([{
                                     "id": new_id, 
-                                    "user_id": current_user_id, # ⭐ UUID 저장
-                                    "username": current_username, # 참조용으로 username도 같이 저장
+                                    "user_id": current_user_id,
+                                    "username": current_username,
                                     "date": selected_date_str,
                                     "content": safe_content, "ai_advice": advice.strip(), "emotion_tag": max(1, min(5, score)),
                                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -651,7 +687,6 @@ else:
                 if btn_name:
                     if check_rate_limit("change_info", 3):
                         safe_name = sanitize_for_sheets(new_nickname)
-                        # ⭐ UUID 기준으로 수정
                         success, msg = update_user_info(current_user_id, new_name=safe_name)
                         if success:
                             st.session_state['user_info']['name'] = safe_name
@@ -680,7 +715,6 @@ else:
                         elif not new_pw:
                             st.warning("새 비밀번호를 입력해주세요.")
                         else:
-                            # ⭐ UUID 기준으로 수정
                             success, msg = update_user_info(current_user_id, new_password=new_pw)
                             if success:
                                 st.cache_data.clear()
