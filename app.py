@@ -1,7 +1,8 @@
 import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
-import google.generativeai as genai
+from google import genai
+import extra_streamlit_components as stx
 from datetime import datetime, timedelta # ⭐ timedelta 추가
 import hashlib
 import json
@@ -101,23 +102,51 @@ MOOD_EMOJIS = {
     5: "🌈 무지개 (매우 좋음)"
 }
 
-# --- 2. 세션 초기화 ---
+# --- 2. 세션 초기화 및 자동 로그인 ---
+# 쿠키 매니저 실행
+cookie_manager = stx.CookieManager()
+
 if 'is_logged_in' not in st.session_state:
-    if "user" in st.query_params and "name" in st.query_params:
-        st.session_state['is_logged_in'] = False
-        st.session_state['user_info'] = None
-    else:
-        st.session_state['is_logged_in'] = False
-        st.session_state['user_info'] = None
+    st.session_state['is_logged_in'] = False
+    st.session_state['user_info'] = None
+
+if 'auth_mode' not in st.session_state:
+    st.session_state['auth_mode'] = 'login'
+
+# ⭐ 쿠키에서 자동 로그인 정보 확인 (세션에 로그인 안 되어 있을 때만)
+if not st.session_state['is_logged_in']:
+    saved_uuid = cookie_manager.get(cookie="remember_user_id")
+    if saved_uuid:
+        try:
+            # DB에서 해당 UUID를 가진 유저 정보 가져오기
+            users_df = conn.read(worksheet="users", ttl=0)
+            user_row = users_df[users_df['user_id'] == saved_uuid]
+            
+            if not user_row.empty:
+                st.session_state['is_logged_in'] = True
+                st.session_state['user_info'] = user_row.iloc[0].to_dict()
+                st.rerun() # 자동 로그인 후 화면 새로고침
+        except Exception as e:
+            pass
 
 if 'auth_mode' not in st.session_state:
     st.session_state['auth_mode'] = 'login'
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 
+# try:
+#     if "GOOGLE_API_KEY" in st.secrets:
+#         genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+#     else:
+#         st.error("설정 오류: secrets.toml에 API 키가 없습니다.")
+# except Exception as e:
+#     st.error(f"오류: {e}")
+client = None  # ⭐ 전역에서 사용할 수 있도록 밖으로 꺼냅니다.
+
 try:
     if "GOOGLE_API_KEY" in st.secrets:
-        genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+        # ⭐ Client 객체 생성 방식으로 변경
+        client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
     else:
         st.error("설정 오류: secrets.toml에 API 키가 없습니다.")
 except Exception as e:
@@ -249,44 +278,59 @@ def get_past_diaries_text(user_id, days=30):
 
 # ⭐ [수정] 프롬프트에 과거 기록(past_history) 반영
 def get_ai_response(user_text, user_name, past_history=""):
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        prompt = f"""
-        당신은 내담자({user_name}님)의 삶의 맥락을 깊이 이해하는 전담 심리 상담가입니다.
-        단편적인 조언이 아니라, 과거의 흐름을 고려하여 통찰력 있는 답변을 해주세요.
-        
-        <context>
-        아래는 {user_name}님이 최근 한 달 동안 작성한 일기 기록입니다.
-        이 기록을 통해 내담자의 최근 감정 변화 추이, 반복되는 고민, 혹은 긍정적인 변화를 파악하세요.
-        
-        {past_history}
-        </context>
+    # model = genai.GenerativeModel('gemini-2.5-flash')
+    prompt = f"""
+    당신은 내담자({user_name}님)의 삶의 맥락을 깊이 이해하는 전담 심리 상담가입니다.
+    단편적인 조언이 아니라, 과거의 흐름을 고려하여 통찰력 있는 답변을 해주세요.
+    
+    <context>
+    아래는 {user_name}님이 최근 한 달 동안 작성한 일기 기록입니다.
+    이 기록을 통해 내담자의 최근 감정 변화 추이, 반복되는 고민, 혹은 긍정적인 변화를 파악하세요.
+    
+    {past_history}
+    </context>
 
-        <diary>
-        오늘의 일기:
-        {user_text}
-        </diary>
-        
-        <instructions>
-        1. **맥락 연결:** 과거 기록과 오늘의 일기를 연결 지어 언급하세요. (예: "지난주에는 ~때문에 힘들어하셨는데, 오늘은 좀 나아지신 것 같아 다행이에요" 또는 "저번부터 계속 ~로 고민이 깊으시군요.")
-        2. **호칭:** 반드시 '{user_name}님'이라고 부르세요.
-        3. **분량:** 따뜻하고 구체적인 조언으로 3~4문장.
-        4. **평가:** 작성자의 오늘 기분을 1~5점 사이의 정수로 평가 (숫자만 출력).
-        
-        [출력형식]
-        조언 내용
-        |||
-        점수
-        </instructions>
-        """
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"AI 연결 실패: {e} ||| 3"
-
+    <diary>
+    오늘의 일기:
+    {user_text}
+    </diary>
+    
+    <instructions>
+    1. **맥락 연결:** 과거 기록과 오늘의 일기를 연결 지어 언급하세요. (예: "지난주에는 ~때문에 힘들어하셨는데, 오늘은 좀 나아지신 것 같아 다행이에요" 또는 "저번부터 계속 ~로 고민이 깊으시군요.")
+    2. **호칭:** 반드시 '{user_name}님'이라고 부르세요.
+    3. **분량:** 따뜻하고 구체적이며 건설적인 조언으로 3~4문장.
+    4. **평가:** 작성자의 오늘 기분을 1~5점 사이의 정수로 평가 (숫자만 출력).
+    
+    [출력형식]
+    조언 내용
+    |||
+    점수
+    </instructions>
+    """
+    max_retries = 3 # 최대 3번 재시도
+    
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt
+            )
+            return response.text
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "Quota" in error_msg:
+                if attempt < max_retries - 1: # 마지막 시도가 아니면
+                    time.sleep(20) # 20초 대기 후 다시 시도
+                    continue
+                else:
+                    return "서버가 너무 바쁩니다. 나중에 [수정] 버튼을 눌러 다시 분석해주세요! ||| 3"
+            else:
+                return f"알 수 없는 오류 발생: {e[:50]} ||| 3"
+    
 def get_chat_response(diary_content, chat_history, new_question, user_name):
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        # model = genai.GenerativeModel('gemini-2.5-flash')
         history_text = ""
         for chat in chat_history:
             role = "상담사" if chat["role"] == "model" else "내담자"
@@ -312,10 +356,20 @@ def get_chat_response(diary_content, chat_history, new_question, user_name):
         {new_question}
         </question>
         """
-        response = model.generate_content(prompt)
+        # response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        return response.text
         return response.text
     except Exception as e:
-        return "죄송해요, 잠시 연결이 불안정합니다."
+        error_msg = str(e)
+        # ⭐ 채팅 중 한도 초과 시 안내
+        if "429" in error_msg or "Quota" in error_msg:
+            return "상담가가 너무 많은 이야기를 처리하느라 잠시 지쳤나 봐요! 1분 뒤에 다시 말을 걸어주시겠어요? 😊"
+        else:
+            return "죄송해요, 잠시 연결이 불안정합니다. 조금 뒤에 다시 시도해 주세요."
 
 @st.dialog("⚠️ 대화 내용 초기화")
 def confirm_reset_dialog(row_id):
@@ -361,6 +415,11 @@ if not st.session_state['is_logged_in']:
                         if user is not None:
                             st.session_state['is_logged_in'] = True
                             st.session_state['user_info'] = user
+                            
+                            # ⭐ 로그인 성공 시 쿠키 저장 (유효기간 30일)
+                            expire_date = datetime.now() + timedelta(days=30)
+                            cookie_manager.set("remember_user_id", user['user_id'], expires_at=expire_date)
+                            
                             st.rerun()
                         else:
                             st.error("아이디 또는 비밀번호를 확인해주세요.")
@@ -449,6 +508,7 @@ else:
         st.markdown("---")
         if st.button("로그아웃", type="secondary", use_container_width=True):
             st.session_state['is_logged_in'] = False
+            cookie_manager.delete("remember_user_id") # ⭐ 쿠키 삭제
             st.query_params.clear()
             st.rerun()
 
@@ -643,34 +703,44 @@ else:
                 if st.form_submit_button("기록 저장하고 조언 듣기 ✨", type="primary", use_container_width=True):
                     if check_rate_limit("new_diary", 5):
                         if content:
-                            # ⭐ [수정] 멘트 변경
-                            with st.spinner("과거의 기억을 되짚으며 분석 중..."):
-                                safe_content = sanitize_for_sheets(content)
-                                
-                                # ⭐ [수정] 1. 과거 기록 가져오기
+                            safe_content = sanitize_for_sheets(content)
+                            
+                            # ⭐ [STEP 1] 먼저 구글 시트에 내 일기만 안전하게 '가저장' 합니다.
+                            all_diaries_latest = conn.read(worksheet="diaries", ttl=0)
+                            if all_diaries_latest.empty or 'id' not in all_diaries_latest.columns: new_id = 1
+                            else: new_id = int(pd.to_numeric(all_diaries_latest['id'], errors='coerce').max()) + 1
+                            
+                            temp_data = pd.DataFrame([{
+                                "id": new_id, 
+                                "user_id": current_user_id,
+                                "username": current_username,
+                                "date": selected_date_str,
+                                "content": safe_content, 
+                                "ai_advice": "AI가 마음을 분석하고 있어요... ⏳ (새로고침 해주세요)", # 임시 문구
+                                "emotion_tag": 3,
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "chat_history": "[]"
+                            }])
+                            updated = pd.concat([all_diaries_latest, temp_data], ignore_index=True) if not all_diaries_latest.empty else temp_data
+                            conn.update(worksheet="diaries", data=updated)
+                            
+                            # ⭐ [STEP 2] 가저장 완료 후, 맘 편하게 AI 분석 시작 (재시도 로직 작동)
+                            with st.spinner("AI가 일기를 읽고 있어요. 💡답변이 완료될 때까지 화면을 끄거나 나가지 말아주세요!"):
                                 past_history = get_past_diaries_text(current_user_id)
-                                
-                                # ⭐ [수정] 2. AI에게 과거 기록과 함께 전달
                                 full_res = get_ai_response(safe_content, current_name, past_history)
                                 
                                 if "|||" in full_res: advice, sc = full_res.split("|||"); score=int(sc.strip())
                                 else: advice=full_res; score=3
                                 
-                                all_diaries_latest = conn.read(worksheet="diaries", ttl=0)
-                                if all_diaries_latest.empty or 'id' not in all_diaries_latest.columns: new_id = 1
-                                else: new_id = int(pd.to_numeric(all_diaries_latest['id'], errors='coerce').max()) + 1
+                                # ⭐ [STEP 3] AI 답변이 무사히 오면, 방금 저장한 행을 찾아서 업데이트(Update)
+                                final_diaries = conn.read(worksheet="diaries", ttl=0)
+                                final_diaries['id'] = pd.to_numeric(final_diaries['id'], errors='coerce')
+                                idx = final_diaries.index[final_diaries['id'] == new_id].tolist()[0]
                                 
-                                new_data = pd.DataFrame([{
-                                    "id": new_id, 
-                                    "user_id": current_user_id,
-                                    "username": current_username,
-                                    "date": selected_date_str,
-                                    "content": safe_content, "ai_advice": advice.strip(), "emotion_tag": max(1, min(5, score)),
-                                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    "chat_history": "[]"
-                                }])
-                                updated = pd.concat([all_diaries_latest, new_data], ignore_index=True) if not all_diaries_latest.empty else new_data
-                                conn.update(worksheet="diaries", data=updated)
+                                final_diaries.at[idx, 'ai_advice'] = advice.strip()
+                                final_diaries.at[idx, 'emotion_tag'] = max(1, min(5, score))
+                                
+                                conn.update(worksheet="diaries", data=final_diaries)
                                 st.cache_data.clear()
                                 st.rerun()
 
