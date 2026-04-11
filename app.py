@@ -113,6 +113,9 @@ if 'is_logged_in' not in st.session_state:
 if 'auth_mode' not in st.session_state:
     st.session_state['auth_mode'] = 'login'
 
+
+conn = st.connection("gsheets", type=GSheetsConnection)
+
 # ⭐ 쿠키에서 자동 로그인 정보 확인 (세션에 로그인 안 되어 있을 때만)
 if not st.session_state['is_logged_in']:
     saved_uuid = cookie_manager.get(cookie="remember_user_id")
@@ -131,8 +134,6 @@ if not st.session_state['is_logged_in']:
 
 if 'auth_mode' not in st.session_state:
     st.session_state['auth_mode'] = 'login'
-
-conn = st.connection("gsheets", type=GSheetsConnection)
 
 # try:
 #     if "GOOGLE_API_KEY" in st.secrets:
